@@ -1,6 +1,6 @@
 from typing import Any, Optional
 from mlspells.base import StringEnum
-
+import os
 
 class ResourceAccessMode(StringEnum):
     Key = "key"
@@ -18,13 +18,13 @@ class ValueSource():
         self.connection_string = connection_string
         self.default = default
 
-        assert source != ValueSourceType.Literal or name or default, "``name`` or ``default`` has to be indicated for ``ValueSourceType.Literal``"
+        assert source != ValueSourceType.Literal or name is None, "``name`` is not valid for ``ValueSourceType.Literal``"
+        assert source != ValueSourceType.Literal or default is not None, "``default`` has to be indicated for ``ValueSourceType.Literal``"
         assert source != ValueSourceType.AzureKeyVault or connection_string, "``connection_string`` is required for ``ValueSourceType.AzureKeyVault``"
 
     def get_value(self, not_null: bool = False) -> Any:
         if self.source == ValueSourceType.Environment:
             value = os.environ.get(self.name, self.default) # type: ignore
-            print("lala", value)
             if value == None and not_null:
                 raise ValueError(f"The environment variable {self.name} is not correctly configured.")
             return value
@@ -50,4 +50,4 @@ class ValueSource():
             else:
                 raise ValueError("``connection_string`` or ``name`` are not configured")
         elif self.source == ValueSourceType.Literal:
-            value = self.default or self.name
+            return self.default

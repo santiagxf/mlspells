@@ -9,6 +9,7 @@ import functools
 
 from mlflow.pyfunc import PythonModel, PythonModelContext
 from mlflow.models.signature import ModelSignature
+from mlflow.utils.environment import _mlflow_conda_env
 
 from azure.core.exceptions import HttpResponseError
 from azure.ai.contentsafety import ContentSafetyClient
@@ -43,9 +44,56 @@ class ModerationAction():
         self.template = "Moderator: {message}. Violation {category} with severity {severity}"
 
 class AzureContentSafetyGuardrailModel(PythonModel):
-    def __init__(self, model_uri: str, column_name: Union[str, None] = None, endpoint_uri: Union[str, None] = None, 
+    def __init__(self, model_uri: str, column_name: Optional[str] = None, endpoint_uri: Optional[str] = None, 
                  access_mode: Optional[ResourceAccessMode] = None, categories: Optional[List[TextCategory]] = None,
                  action: Optional[ModerationAction] = None, config: Optional[Dict[str, ValueSource]] = None):
+        """Creates a Python Model for MLflow that can apply content moderation to a base model.
+
+        Parameters
+        ----------
+        model_uri : str
+            The URI of the model you want to moderate. You can use a path to a local MLflow model
+            or a URI like `models:/mymodel/latest.
+        column_name : Optional[str], optional
+            The name of the column you want to moderate, in case the model returns multiple
+            columns, by default None. Needs to be indicated for models that has a ColSpec
+            signature.
+        endpoint_uri : Optional[str], optional
+            The URL of the Azure Content Safety service, by default None. If not provided,
+            a configuration with key `endpoint_uri` needs to be configured.
+        access_mode : Optional[ResourceAccessMode], optional
+            The access configuration for the Azure Content Safety service. If not configured,
+            Key-based access will be used. When `ResourceAccessMode.Key` is used, a configuration
+            with key `key` needs to be added to provide the given key.
+        categories : Optional[List[TextCategory]], optional
+            The moderation categories you want to moderate for, by default None
+        action : Optional[ModerationAction], optional
+            The action that has to be taken if the moderation detects unsuitable content, by
+            default, ModerationActionBehavior.Drop is used.
+        config : Optional[Dict[str, ValueSource]], optional
+            A dictionary with the configuration of the model, by default None. You can use this
+            configuration to control most of the properties of the model either by providing a
+            value or by configuring environment variables to read the configuration from.
+
+            For instance, use the following configuration to pull information from environment
+            variables:
+
+            config = { 
+                "endpoint_uri": ValueSource(ValueSourceType.Environment, "ACS_ENDPOINT_URI"),
+                "key": ValueSource(ValueSourceType.Environment, "ACS_ENDPOINT_KEY"),
+            }
+
+            You can also use Azure Key Value to protect values:
+
+            config = { 
+                "endpoint_uri": ValueSource(ValueSourceType.Environment, "ACS_ENDPOINT_URI"),
+                "key": ValueSource(
+                    ValueSourceType.AzureKeyVault, 
+                    "ACS_ENDPOINT_KEY", 
+                    connection_string="<akv connection string>"
+                ),
+            }            
+        """
         self._model_artifact = "model"
         self._conf_key = "key"
         self._conf_column_name = "column_name"
@@ -67,9 +115,9 @@ class AzureContentSafetyGuardrailModel(PythonModel):
 
         self.config = config or {}
         if access_mode:
-            self.config[self._conf_access_mode] = ValueSource(ValueSourceType.Literal, str(access_mode))
+            self.config[self._conf_access_mode] = ValueSource(ValueSourceType.Literal, default=str(access_mode))
         if endpoint_uri:
-            self.config[self._conf_endpoint_uri] = ValueSource(ValueSourceType.Literal, endpoint_uri)
+            self.config[self._conf_endpoint_uri] = ValueSource(ValueSourceType.Literal, default=endpoint_uri)
         if isinstance(self.config[self._conf_key], str):
             self.config[self._conf_key] = ValueSource(ValueSourceType.Literal, default=self.config[self._conf_key])
         if self._conf_severity_limit not in self.config.keys():
@@ -88,17 +136,22 @@ class AzureContentSafetyGuardrailModel(PythonModel):
         
         self.endpoint_uri = self.config[self._conf_endpoint_uri].get_value()
         self.access_mode = self.config[self._conf_access_mode].get_value()
+        self.max_rps = self.config[self._conf_acs_rps].get_value()
+        self.severity_limit = self.config[self._conf_severity_limit].get_value()
         prepare_async()
 
-    def get_secret(self) -> str:
+    def _get_secret(self) -> str:
         if self.access_mode == ResourceAccessMode.Key:
             key = self.config[self._conf_key].get_value(not_null=True)
+        elif self.access_mode == ResourceAccessMode.RBAC:
+            raise NotImplementedError(ResourceAccessMode.RBAC)
         else:
-            key = None
+            raise ValueError(self.access_mode)
 
         assert isinstance(key, str), f"Unable to get a valid secret from {self.config[self._conf_key].source}"
+        return key
         
-    def moderate(self, contents, moderations):
+    def _moderate(self, contents, moderations):
         for idx in range(len(contents)):
             if moderations[idx]:
                 for category, result in moderations[idx].items():
@@ -124,7 +177,7 @@ class AzureContentSafetyGuardrailModel(PythonModel):
 
         return contents
 
-    async def analyze_content_async(self, contents: np.ndarray):
+    async def _analyze_content_async(self, contents: np.ndarray):
         async def analyze_content_request_async(client, request, idx):
             try:
                 response = client.analyze_text(request)
@@ -141,7 +194,7 @@ class AzureContentSafetyGuardrailModel(PythonModel):
         results = np.arange(len(contents), dtype=object)
         pending = range(len(contents))
         for retry in range(1, 4):
-            client = ContentSafetyClient(self.endpoint_uri, AzureKeyCredential(self.get_secret()))
+            client = ContentSafetyClient(self.endpoint_uri, AzureKeyCredential(self._get_secret()))
 
             errors = {}
             requests = [
@@ -150,7 +203,7 @@ class AzureContentSafetyGuardrailModel(PythonModel):
             ]
             await aiometer.run_all(
                 requests, 
-                max_per_second=self.config[self._conf_acs_rps].get_value(),
+                max_per_second=self.max_rps,
             )
 
             if errors:
@@ -183,14 +236,45 @@ class AzureContentSafetyGuardrailModel(PythonModel):
         else:
             raise ValueError(f"Model returned a type {str(type(predictions))} but we don't know how to read it")
             
-        moderation = run_async(self.analyze_content_async(contents))
-        self.moderate(contents, moderation)
+        moderation = run_async(self._analyze_content_async(contents))
+        self._moderate(contents, moderation)
 
         return contents
 
-    def log_model(self, artifact_path: str, signature: ModelSignature, registered_model_name: str):
-        pip_requirements = mlflow.utils.requirements_utils._infer_requirements(self.model_uri)
-        extra_pip_requirements = ["aiometer", "azure-ai-contentsafety"]
+    def save_model(self, path: str):
+        pip_requirements = mlflow.utils.requirements_utils._infer_requirements(self.model_uri, "pyfunc")
+        pip_requirements.extend(["aiometer", "azure-ai-contentsafety"])
+
+        if any([ conf.source == ValueSourceType.AzureKeyVault for _, conf in self.config.items() ]):
+            pip_requirements.append("azure-keyvault-secrets")
+
+        custom_env =_mlflow_conda_env(
+            additional_conda_deps=None,
+            additional_pip_deps=pip_requirements,
+            additional_conda_channels=None,
+        )
+
+        mlflow.pyfunc.save_model(
+            path,
+            python_model=self,
+            artifacts={
+                "model": self.model_uri
+            },
+            conda_env=custom_env,
+        ) 
+
+    def log_model(self, artifact_path: str, registered_model_name: Optional[str]=None):
+        pip_requirements = mlflow.utils.requirements_utils._infer_requirements(self.model_uri, "pyfunc")
+        pip_requirements.extend(["aiometer", "azure-ai-contentsafety"])
+
+        if any([ conf.source == ValueSourceType.AzureKeyVault for _, conf in self.config.items() ]):
+            pip_requirements.append("azure-keyvault-secrets")
+
+        custom_env =_mlflow_conda_env(
+            additional_conda_deps=None,
+            additional_pip_deps=pip_requirements,
+            additional_conda_channels=None,
+        )
 
         return mlflow.pyfunc.log_model(
             artifact_path, 
@@ -198,7 +282,6 @@ class AzureContentSafetyGuardrailModel(PythonModel):
             artifacts={
                 "model": self.model_uri
             },
-            signature=signature,
             pip_requirements=pip_requirements,
-            extra_pip_requirements=extra_pip_requirements,
+            conda_env=custom_env,
             registered_model_name=registered_model_name)
